@@ -27,7 +27,11 @@ import java.util.HashMap;
 import java.util.Iterator;
 
 import hu.mta.sztaki.lpds.cloud.simulator.iaas.IaaSService;
+import hu.mta.sztaki.lpds.cloud.simulator.iaas.PhysicalMachine.ResourceAllocation;
+import hu.mta.sztaki.lpds.cloud.simulator.iaas.VMManager.VMManagementException;
 import hu.mta.sztaki.lpds.cloud.simulator.iaas.VirtualMachine;
+import hu.mta.sztaki.lpds.cloud.simulator.iaas.VirtualMachine.StateChangeException;
+import hu.mta.sztaki.lpds.cloud.simulator.io.NetworkNode.NetworkException;
 
 /**
  * The class applies a simple threshold based scaling mechanism: it removes VMs
@@ -49,7 +53,9 @@ public class SolutionVI extends VirtualInfrastructure {
 	 * the virtual infrastructure does not need a new VM with the same kind of
 	 * executable).
 	 */
-	public static final double maxUtilisationLevelBeforeNewVM = .7;
+	public static final double maxUtilisationLevelBeforeNewPoolInc = .80;
+	public static final double maxUtilisationLevelBeforeNewVM = .65;
+	public HashMap<String, Integer> poolSize = new HashMap<String, Integer>();
 
 	/**
 	 * We keep track of how many times we found the last VM completely unused for an
@@ -66,6 +72,8 @@ public class SolutionVI extends VirtualInfrastructure {
 		super(cloud);
 	}
 
+	private boolean startup = true;
+
 	/**
 	 * The auto scaling mechanism that is run regularly to determine if the virtual
 	 * infrastructure needs some changes. The logic is the following:
@@ -80,73 +88,113 @@ public class SolutionVI extends VirtualInfrastructure {
 	 * <li>if all the VMs of a given executable experience an average utilisation of
 	 * a given minimum value, then a new VM is created.</li>
 	 * </ul>
+	 * 
+	 * @throws NetworkException
+	 * @throws VMManagementException
 	 */
 	@Override
 	public void tick(long fires) {
-		final Iterator<String> kinds = vmSetPerKind.keySet().iterator();
-		// get each kind of application and create a new VM for that type
-		while (kinds.hasNext()) {
-			final String kind = kinds.next();
-			final ArrayList<VirtualMachine> vmset = vmSetPerKind.get(kind);
-				if (vmset.size() < 1) {
+		Iterator<String> kinds = vmSetPerKind.keySet().iterator();
+		//On start up define poolSize for each kind
+		if (this.startup) {
+			while (kinds.hasNext()) {
+				String kind = kinds.next();
+				poolSize.put(kind, 3);
+				for (int i = 0; i < 3; i++) {
 					requestVM(kind);
-					continue;
-				} else {
-					//Removing the last vm of its kind check
-					if (vmset.size() == 1) {
-						final VirtualMachine onlyMachine = vmset.get(0);
-						if (onlyMachine.underProcessing.isEmpty() && onlyMachine.toBeAdded.isEmpty()) {
-							// Check the last VM is not Processing anything and create a counter to count 
-							//how many times in a hour the VM isn't used before destroying
-							Integer i = unnecessaryHits.get(onlyMachine);
-							if (i == null) {
-								unnecessaryHits.put(onlyMachine, 1);
-							} else {
-								i++;
-								if (i < 30) {
-									unnecessaryHits.put(onlyMachine, i);
-								} else {
-									// One hour of the vm not being used we can then destroy it
-									unnecessaryHits.remove(onlyMachine);
-									destroyVM(onlyMachine);
-									kinds.remove();
-								}
-							}
-							// We don't need to check if we need more VMs as it has no computation
-							continue;
-						}
-						unnecessaryHits.remove(onlyMachine);
-						// We can now check if any VM's are not processing anything and have been low utilisation level for an hour before removing
+				}
+			}
+			this.startup = false;
+		}
+		while (kinds.hasNext()) {
+			String kind = kinds.next();
+			ArrayList<VirtualMachine> vmset = vmSetPerKind.get(kind);
+			//Check if the last VM is not being used
+			if (vmset.size() == 1) {
+				VirtualMachine lastVM = vmset.get(0);
+				if (lastVM.underProcessing.isEmpty() && lastVM.toBeAdded.isEmpty()) {
+					//Wait one hour in ticks to see if the vm receives a job if not remove vm
+					if (hitIncrement(lastVM, 30)) {
+						kinds.remove();
 					} else {
-						boolean destroyed = false;
-						for (int counter = 0; counter < vmset.size(); counter++) {
-							final VirtualMachine vm = vmset.get(counter);
-							if (vm.underProcessing.isEmpty() && vm.toBeAdded.isEmpty()) {
-								// The VM has no task on it at the moment, good candidate
-								if (getHourlyUtilisationPercForVM(vm) < minUtilisationLevelBeforeDestruction) {
-									// The VM's load was under 10% in the past hour
-									destroyVM(vm);
-									destroyed = true;
-									counter--;
-								}
-							}
-						}
-						if (destroyed) {
-							// No need to check the average workload now, as we just destroyed a VM..
-							continue;
-						}
+						unnecessaryHits.remove(lastVM);
 					}
 
-					// Check if new VM's need to be added
-					double VMsUtilPercent = 0;
-					for (VirtualMachine vm : vmset) {
-						VMsUtilPercent += getHourlyUtilisationPercForVM(vm);
+				}
+				//Check the pool to see if any VM's aren't being utilised 
+			} else if (vmset.size() == poolSize.get(kind)) {
+				for (int i = 0; i < vmset.size(); i++) {
+					VirtualMachine lastPoolVMs = vmset.get(i);
+					if (getHourlyUtilisationPercForVM(lastPoolVMs) < minUtilisationLevelBeforeDestruction) {
+						//20 minute timer to check if the pool size should decrease
+						if (hitIncrement(lastPoolVMs, 10)) {
+							Integer temp = poolSize.get(kind);
+							temp--;
+							poolSize.put(kind, temp);
+							i--;
+						}
+					} else {
+						unnecessaryHits.remove(lastPoolVMs);
 					}
-					if (VMsUtilPercent / vmset.size() > maxUtilisationLevelBeforeNewVM) {
-						// Average utilisation of VMs are over threshold, we need a new one
-						requestVM(kind);
+				}
+
+			} else {
+				//Check if the added VM's should be removed
+				for (int i = 0; i < vmset.size(); i++) {
+					VirtualMachine VMs = vmset.get(i);
+					if (VMs.underProcessing.isEmpty() && VMs.toBeAdded.isEmpty()) {
+						if (getHourlyUtilisationPercForVM(VMs) < minUtilisationLevelBeforeDestruction) {
+							//Wait 2 ticks before removing the VM
+							if (hitIncrement(VMs, 2)) {
+								i--;
+							}
+						} else {
+							unnecessaryHits.remove(VMs);
+						}
+					} else {
+						unnecessaryHits.remove(VMs);
 					}
+				}
+			}
+			// Adding VM's
+			double subHourUtilSum = 0;
+			for (VirtualMachine vm : vmset) {
+				subHourUtilSum += getHourlyUtilisationPercForVM(vm);
+			}
+			//If above MaxutilPool add a new VM to the pool to deal with the overload
+			if (subHourUtilSum / vmset.size() > maxUtilisationLevelBeforeNewPoolInc) {
+				Integer temp = poolSize.get(kind);
+				temp++;
+				poolSize.put(kind, temp);
+				requestVM(kind);
+				//Else add a normal VM which will be removed shortly after
+			} else if (subHourUtilSum / vmset.size() > maxUtilisationLevelBeforeNewVM) {
+				requestVM(kind);
+			}
+
+		}
+	}
+	
+	
+	/**
+	 * This method is used to count hits before removing a VM
+	 * 
+	 * @param VirtualMachine, Integer
+	 */
+	private boolean hitIncrement(VirtualMachine lastVM, int hits) {
+		Integer hitIncrement = unnecessaryHits.get(lastVM);
+		if (hitIncrement == null)
+			unnecessaryHits.put(lastVM, 1);
+		else {
+			hitIncrement++;
+			if (hitIncrement < hits) {
+				unnecessaryHits.put(lastVM, hitIncrement);
+			} else {
+				unnecessaryHits.remove(lastVM);
+				destroyVM(lastVM);
+				return true;
 			}
 		}
+		return false;
 	}
 }
